@@ -9,7 +9,7 @@
 # IMPORTANT: update the FROM line below to your actual Docker Hub username
 # once Dockerfile.colmap-base has been built and pushed successfully.
 
-FROM yourusername/oblaq-colmap-base:latest
+FROM dakord/oblaq-colmap-base:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 
