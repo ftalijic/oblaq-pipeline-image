@@ -1,0 +1,75 @@
+# oblaQ COLMAP Base Image — build once, rarely needs rebuilding
+#
+# Contains the fully validated, CUDA-enabled COLMAP build. This should only
+# need rebuilding if the pinned COLMAP commit or the base CUDA/Ubuntu version
+# changes - NOT every time the Nerfstudio/Python side needs a fix.
+#
+# Push this once to Docker Hub as e.g. yourusername/oblaq-colmap-base:latest,
+# then the slim Dockerfile.nerfstudio starts FROM this image instead of
+# rebuilding COLMAP from scratch on every Python-side fix.
+
+# ============================================================
+# STAGE 1: builder — compiles COLMAP, discarded after this stage
+# ============================================================
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    git cmake ninja-build build-essential \
+    libboost-program-options-dev libboost-graph-dev libboost-system-dev \
+    libeigen3-dev libopenimageio-dev openimageio-tools libmetis-dev \
+    libgoogle-glog-dev libgtest-dev libgmock-dev libsqlite3-dev libglew-dev \
+    qtbase5-dev libqt5opengl5-dev libcgal-dev libceres-dev \
+    libqt5svg5-dev libopencv-dev \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# CMake fix: apt's 3.22.1 is too old for COLMAP's bundled faiss (needs 3.24+).
+RUN cd /tmp && \
+    wget https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0-linux-x86_64.tar.gz && \
+    tar -xzf cmake-3.29.0-linux-x86_64.tar.gz && \
+    mv cmake-3.29.0-linux-x86_64 /opt/cmake-3.29.0 && \
+    rm cmake-3.29.0-linux-x86_64.tar.gz
+ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
+
+# COLMAP: pinned commit, CUDA enabled, explicit compute capability (89 = Ada
+# Lovelace). Install to /opt/colmap-install instead of the default /usr/local,
+# so Stage 2 can cleanly copy just that one self-contained folder.
+RUN cd /root && \
+    git clone https://github.com/colmap/colmap.git && \
+    cd colmap && \
+    git checkout fff58c71 && \
+    mkdir build && cd build && \
+    cmake .. -GNinja -DCUDA_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_INSTALL_PREFIX=/opt/colmap-install && \
+    ninja -j2 && \
+    ninja install && \
+    rm -rf /root/colmap
+
+# ============================================================
+# STAGE 2: final — clean image, just the finished COLMAP install
+# ============================================================
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime libraries COLMAP's compiled binary needs. Reusing the same -dev
+# package names proven to work in Stage 1 (rather than guessing minimal
+# runtime-only package names, which failed on libcgal13 not existing -
+# CGAL is header-only in this build and needs no runtime package at all).
+RUN apt-get update && apt-get install -y \
+    libboost-program-options-dev libboost-graph-dev libboost-system-dev \
+    libopenimageio-dev libmetis-dev \
+    libgoogle-glog-dev libsqlite3-dev libglew-dev \
+    qtbase5-dev libqt5opengl5-dev libqt5svg5-dev \
+    libceres-dev libopencv-dev \
+    tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/colmap-install /opt/colmap-install
+ENV PATH="/opt/colmap-install/bin:${PATH}"
+
+RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check base image / build args" && exit 1)
+
+WORKDIR /root
+CMD ["/bin/bash"]
