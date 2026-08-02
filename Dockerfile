@@ -68,12 +68,16 @@ FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime libraries COLMAP's compiled binary needs (no compiler/build tools required here)
+# Runtime libraries COLMAP's compiled binary needs. Reusing the same -dev
+# package names proven to work in Stage 1 (rather than guessing minimal
+# runtime-only package names, which failed on libcgal13 not existing -
+# CGAL is header-only in this build and needs no runtime package at all).
 RUN apt-get update && apt-get install -y \
-    libboost-program-options1.74.0 libboost-graph1.74.0 libboost-system1.74.0 \
-    libopenimageio2.2 libmetis5 libgoogle-glog0v5 libsqlite3-0 libglew2.2 \
-    libqt5core5a libqt5gui5 libqt5widgets5 libqt5opengl5 libqt5svg5 \
-    libcgal13 libceres2 libopencv-core4.5d libopencv-imgproc4.5d \
+    libboost-program-options-dev libboost-graph-dev libboost-system-dev \
+    libopenimageio-dev libmetis-dev \
+    libgoogle-glog-dev libsqlite3-dev libglew-dev \
+    qtbase5-dev libqt5opengl5-dev libqt5svg5-dev \
+    libceres-dev libopencv-dev \
     python3 python3-venv python3-pip \
     tmux \
     && rm -rf /var/lib/apt/lists/*
