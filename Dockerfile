@@ -35,6 +35,22 @@ RUN /root/nerfstudio-env/bin/pip install --upgrade pip && \
 
 RUN echo "source /root/nerfstudio-env/bin/activate" >> /root/.bashrc
 
+# COLMAP PATH fix: installed to /opt/colmap-install/bin by the base image
+# but not in the default PATH — add it permanently so 'colmap' works without
+# manual export every session.
+RUN echo 'export PATH="/opt/colmap-install/bin:$PATH"' >> /root/.bashrc
+
+# ffmpeg: required by ns-process-data for image/video handling.
+# Not included in the base image, confirmed missing during first real pipeline run.
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
+# Nerfstudio camera model 17 patch: Nerfstudio's pinned COLMAP parser doesn't
+# include model ID 17 (EQUIRECTANGULAR), causing a KeyError if COLMAP was run
+# with --ImageReader.camera_model EQUIRECTANGULAR. Adding it for robustness
+# even though the current pipeline uses SIMPLE_RADIAL (the default).
+RUN sed -i 's/CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),/CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),\n    CameraModel(model_id=17, model_name="EQUIRECTANGULAR", num_params=2),/' \
+    /root/nerfstudio-env/lib/python3.11/site-packages/nerfstudio/data/utils/colmap_parsing_utils.py
+
 # --- SSH setup ---
 # RunPod injects the pod's authorized public key via a $PUBLIC_KEY environment
 # variable at container start (same convention their own stock templates
