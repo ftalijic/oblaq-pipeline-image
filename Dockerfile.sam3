@@ -1,0 +1,65 @@
+# oblaQ SAM3 Masking Image
+#
+# Separate from dakord/oblaq-pipeline deliberately - SAM3 via Ultralytics
+# requires Python 3.12 + PyTorch 2.7+, which conflicts with the pinned
+# Python 3.11 environment in the pipeline image. Masking runs as a
+# pre-processing step before COLMAP anyway, so there's no reason for these
+# two environments to share an image.
+#
+# Workflow:
+#   1. Spin up a pod with dakord/oblaq-sam3:latest
+#   2. Upload frames + sam3.pt checkpoint
+#   3. Run generate_sam3_masks.py to produce per-frame masks
+#   4. Download masks, terminate pod
+#   5. Spin up pod with dakord/oblaq-pipeline:latest for COLMAP + Nerfstudio
+#
+# SAM3 checkpoint (sam3.pt) is NOT baked into this image - it requires
+# Hugging Face access approval (https://huggingface.co/facebook/sam3) and
+# must be uploaded to the pod at runtime. This keeps the image to a
+# reasonable size and avoids embedding gated weights in a Docker image.
+
+FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps
+RUN apt-get update && apt-get install -y \
+    python3.12 python3.12-venv python3.12-dev \
+    python3-pip \
+    build-essential \
+    git \
+    openssh-server \
+    tmux \
+    wget \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python environment
+RUN python3.12 -m venv /root/sam3-env
+
+# Ultralytics (includes SAM3 as of 8.3.237+)
+RUN /root/sam3-env/bin/pip install --upgrade pip && \
+    /root/sam3-env/bin/pip install ultralytics && \
+    /root/sam3-env/bin/pip install torch==2.7.0 torchvision \
+        --index-url https://download.pytorch.org/whl/cu126 && \
+    /root/sam3-env/bin/pip install numpy pillow opencv-python-headless scipy
+
+# Ultralytics CLIP fix - the standard clip package causes a
+# 'SimpleTokenizer' TypeError when using SAM3 text prompts.
+RUN /root/sam3-env/bin/pip uninstall clip -y || true && \
+    /root/sam3-env/bin/pip install \
+        git+https://github.com/ultralytics/CLIP.git
+
+RUN echo "source /root/sam3-env/bin/activate" >> /root/.bashrc
+
+# SSH setup (same pattern as oblaq-pipeline)
+RUN mkdir -p /var/run/sshd && \
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+COPY start.sh /root/start.sh
+RUN chmod +x /root/start.sh
+
+WORKDIR /root
+ENTRYPOINT ["/root/start.sh"]
