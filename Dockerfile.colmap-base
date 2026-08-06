@@ -1,18 +1,34 @@
-# oblaQ COLMAP Base Image — v2
+# oblaQ COLMAP Base Image — v3
 #
-# Updates from v1:
-# 1. Ceres compiled with cuDSS (CUDA) support — GPU-accelerated bundle
-#    adjustment in global_mapper, potentially cutting ~22min to a few minutes
-# 2. Vocabulary tree file included — enables vocab_tree_matcher as a faster
-#    alternative to exhaustive_matcher for large datasets (1000+ frames)
-# 3. Multi-architecture CUDA build (86+89) — Ampere (A100, A40, RTX 3090)
-#    AND Ada Lovelace (RTX 4000 Ada, RTX 4090) supported in one image
-# 4. ninja -j4 instead of -j2 — faster compile on GitHub Actions runners
-#    (fallback to -j2 if runner OOMs during build)
+# Major update: pinned to COLMAP 4.1.1 (released 2026-07-17, commit a0d785f)
 #
-# Contains the fully validated, CUDA-enabled COLMAP build. This should only
-# need rebuilding if the pinned COLMAP commit, CUDA version, or these
-# dependencies change — NOT every time the Nerfstudio/Python side needs a fix.
+# Why 4.1.1 over the previous pinned commit (fff58c71 / ~3.x era):
+#
+# 1. CASPAR GPU bundle adjustment (-DCASPAR_ENABLED=ON)
+#    GPU-accelerated BA backend, 1-2 orders of magnitude faster than Ceres CUDA.
+#    Use at runtime with: --BundleAdjustment.backend CASPAR
+#    Replaces the cuDSS/Ceres CUDA approach entirely — Caspar is far more powerful.
+#
+# 2. Native EQUIRECTANGULAR camera model
+#    COLMAP now natively supports 360° equirectangular reconstruction without
+#    rendering perspective crops first. Use --ImageReader.camera_model EQUIRECTANGULAR
+#    in feature extraction — this is the correct model for X5 captures.
+#    (Previously this flag was tried but failed at the Nerfstudio stage; now that
+#    the camera model is natively supported end-to-end, it should work correctly.)
+#
+# 3. RANSAC/LORANSAC matching slowdown fix (~4-6x)
+#    Fixes a process-global OpenMP critical section that caused exhaustive matching
+#    to appear "stuck" at large block sizes — the mysterious block_size=300 hang.
+#
+# 4. Multi-architecture CUDA build (86=Ampere + 89=Ada Lovelace)
+#    One image works on RTX 4090 (Ada) and A100/A40/RTX 3090 (Ampere) pods.
+#
+# 5. Vocabulary tree included
+#    256K word tree baked in at /opt/colmap-vocab/vocab_tree_256K.bin
+#    Use with: --VocabTreeMatching.vocab_tree_path /opt/colmap-vocab/vocab_tree_256K.bin
+#
+# Note: cuDSS support was added in v2 of this Dockerfile but is now superseded
+# by Caspar, which is 10-100x faster than Ceres+cuDSS for the same problems.
  
 # ============================================================
 # STAGE 1: builder — compiles COLMAP, discarded after this stage
@@ -39,45 +55,33 @@ RUN cd /tmp && \
     rm cmake-3.29.0-linux-x86_64.tar.gz
 ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
  
-# cuDSS: CUDA-accelerated sparse linear solver for Ceres bundle adjustment.
-# Requires the cuDSS library from NVIDIA's CUDA toolkit extras.
-# Without this, Ceres falls back to CPU-only dense solvers (the
-# "Requested to use GPU for bundle adjustment, but Ceres was compiled without
-# CUDA support" warning seen in global_mapper runs).
-RUN apt-get update && apt-get install -y \
-    libcudss-dev \
-    && rm -rf /var/lib/apt/lists/* || \
-    echo "libcudss-dev not in apt — will try CUDA toolkit path"
- 
-# COLMAP: pinned commit, CUDA enabled, multi-arch (86=Ampere, 89=Ada Lovelace),
-# Ceres CUDA enabled for GPU bundle adjustment.
-# ninja -j4: faster than -j2 on GitHub Actions runners (updated RAM allowance).
+# COLMAP 4.1.1 with Caspar GPU bundle adjustment enabled.
+# -DCASPAR_ENABLED=ON: enables Caspar (disabled by default, requires CUDA ≥7.0).
+# -DCMAKE_CUDA_ARCHITECTURES="86;89": Ampere + Ada Lovelace (A100/A40/3090 + 4090/4000Ada).
+# ninja -j4: faster than -j2 on GitHub Actions runners.
 # If runner OOMs during build, fall back to ninja -j2.
 RUN cd /root && \
     git clone https://github.com/colmap/colmap.git && \
     cd colmap && \
-    git checkout fff58c71 && \
+    git checkout a0d785f && \
     mkdir build && cd build && \
     cmake .. -GNinja \
         -DCUDA_ENABLED=ON \
+        -DCASPAR_ENABLED=ON \
         -DCMAKE_CUDA_ARCHITECTURES="86;89" \
         -DCMAKE_INSTALL_PREFIX=/opt/colmap-install \
-        -DFETCH_CERES=OFF \
-        -DCERES_CUDA_ENABLED=ON \
     && \
     ninja -j4 && \
     ninja install && \
     rm -rf /root/colmap
  
-# Vocabulary tree file for vocab_tree_matcher — faster alternative to
-# exhaustive_matcher for large datasets (1000+ frames). Downloaded once,
-# baked into image so it's always available without manual upload.
-# Using the 256K word tree — good balance of speed and accuracy for
-# room-scale real estate captures.
+# Vocabulary tree (256K words) baked in for vocab_tree_matcher.
+# Faster alternative to exhaustive_matcher for large datasets (1000+ frames).
+# Usage: --VocabTreeMatching.vocab_tree_path $COLMAP_VOCAB_TREE
 RUN mkdir -p /opt/colmap-vocab && \
     wget -q https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin \
         -O /opt/colmap-vocab/vocab_tree_256K.bin && \
-    echo "Vocab tree downloaded: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
+    echo "Vocab tree: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
  
 # ============================================================
 # STAGE 2: final — clean image, just the finished COLMAP install
@@ -99,12 +103,10 @@ COPY --from=builder /opt/colmap-install /opt/colmap-install
 COPY --from=builder /opt/colmap-vocab /opt/colmap-vocab
  
 ENV PATH="/opt/colmap-install/bin:${PATH}"
- 
-RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check base image / build args" && exit 1)
- 
-# Vocab tree path hint — use this in vocab_tree_matcher commands:
-# --VocabTreeMatching.vocab_tree_path /opt/colmap-vocab/vocab_tree_256K.bin
 ENV COLMAP_VOCAB_TREE="/opt/colmap-vocab/vocab_tree_256K.bin"
+ 
+RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check build args" && exit 1)
  
 WORKDIR /root
 CMD ["/bin/bash"]
+ 
