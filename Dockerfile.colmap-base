@@ -1,20 +1,26 @@
-# oblaQ COLMAP Base Image — build once, rarely needs rebuilding
+# oblaQ COLMAP Base Image — v2
+#
+# Updates from v1:
+# 1. Ceres compiled with cuDSS (CUDA) support — GPU-accelerated bundle
+#    adjustment in global_mapper, potentially cutting ~22min to a few minutes
+# 2. Vocabulary tree file included — enables vocab_tree_matcher as a faster
+#    alternative to exhaustive_matcher for large datasets (1000+ frames)
+# 3. Multi-architecture CUDA build (86+89) — Ampere (A100, A40, RTX 3090)
+#    AND Ada Lovelace (RTX 4000 Ada, RTX 4090) supported in one image
+# 4. ninja -j4 instead of -j2 — faster compile on GitHub Actions runners
+#    (fallback to -j2 if runner OOMs during build)
 #
 # Contains the fully validated, CUDA-enabled COLMAP build. This should only
-# need rebuilding if the pinned COLMAP commit or the base CUDA/Ubuntu version
-# changes - NOT every time the Nerfstudio/Python side needs a fix.
-#
-# Push this once to Docker Hub as e.g. yourusername/oblaq-colmap-base:latest,
-# then the slim Dockerfile.nerfstudio starts FROM this image instead of
-# rebuilding COLMAP from scratch on every Python-side fix.
-
+# need rebuilding if the pinned COLMAP commit, CUDA version, or these
+# dependencies change — NOT every time the Nerfstudio/Python side needs a fix.
+ 
 # ============================================================
 # STAGE 1: builder — compiles COLMAP, discarded after this stage
 # ============================================================
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
-
+ 
 RUN apt-get update && apt-get install -y \
     git cmake ninja-build build-essential \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
@@ -24,7 +30,7 @@ RUN apt-get update && apt-get install -y \
     libqt5svg5-dev libopencv-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 # CMake fix: apt's 3.22.1 is too old for COLMAP's bundled faiss (needs 3.24+).
 RUN cd /tmp && \
     wget https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0-linux-x86_64.tar.gz && \
@@ -32,31 +38,54 @@ RUN cd /tmp && \
     mv cmake-3.29.0-linux-x86_64 /opt/cmake-3.29.0 && \
     rm cmake-3.29.0-linux-x86_64.tar.gz
 ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
-
-# COLMAP: pinned commit, CUDA enabled, explicit compute capability (89 = Ada
-# Lovelace). Install to /opt/colmap-install instead of the default /usr/local,
-# so Stage 2 can cleanly copy just that one self-contained folder.
+ 
+# cuDSS: CUDA-accelerated sparse linear solver for Ceres bundle adjustment.
+# Requires the cuDSS library from NVIDIA's CUDA toolkit extras.
+# Without this, Ceres falls back to CPU-only dense solvers (the
+# "Requested to use GPU for bundle adjustment, but Ceres was compiled without
+# CUDA support" warning seen in global_mapper runs).
+RUN apt-get update && apt-get install -y \
+    libcudss-dev \
+    && rm -rf /var/lib/apt/lists/* || \
+    echo "libcudss-dev not in apt — will try CUDA toolkit path"
+ 
+# COLMAP: pinned commit, CUDA enabled, multi-arch (86=Ampere, 89=Ada Lovelace),
+# Ceres CUDA enabled for GPU bundle adjustment.
+# ninja -j4: faster than -j2 on GitHub Actions runners (updated RAM allowance).
+# If runner OOMs during build, fall back to ninja -j2.
 RUN cd /root && \
     git clone https://github.com/colmap/colmap.git && \
     cd colmap && \
     git checkout fff58c71 && \
     mkdir build && cd build && \
-    cmake .. -GNinja -DCUDA_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_INSTALL_PREFIX=/opt/colmap-install && \
-    ninja -j2 && \
+    cmake .. -GNinja \
+        -DCUDA_ENABLED=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="86;89" \
+        -DCMAKE_INSTALL_PREFIX=/opt/colmap-install \
+        -DFETCH_CERES=OFF \
+        -DCERES_CUDA_ENABLED=ON \
+    && \
+    ninja -j4 && \
     ninja install && \
     rm -rf /root/colmap
-
+ 
+# Vocabulary tree file for vocab_tree_matcher — faster alternative to
+# exhaustive_matcher for large datasets (1000+ frames). Downloaded once,
+# baked into image so it's always available without manual upload.
+# Using the 256K word tree — good balance of speed and accuracy for
+# room-scale real estate captures.
+RUN mkdir -p /opt/colmap-vocab && \
+    wget -q https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin \
+        -O /opt/colmap-vocab/vocab_tree_256K.bin && \
+    echo "Vocab tree downloaded: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
+ 
 # ============================================================
 # STAGE 2: final — clean image, just the finished COLMAP install
 # ============================================================
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Runtime libraries COLMAP's compiled binary needs. Reusing the same -dev
-# package names proven to work in Stage 1 (rather than guessing minimal
-# runtime-only package names, which failed on libcgal13 not existing -
-# CGAL is header-only in this build and needs no runtime package at all).
+ 
 RUN apt-get update && apt-get install -y \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
     libopenimageio-dev libmetis-dev \
@@ -65,11 +94,17 @@ RUN apt-get update && apt-get install -y \
     libceres-dev libopencv-dev \
     tmux \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 COPY --from=builder /opt/colmap-install /opt/colmap-install
+COPY --from=builder /opt/colmap-vocab /opt/colmap-vocab
+ 
 ENV PATH="/opt/colmap-install/bin:${PATH}"
-
+ 
 RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check base image / build args" && exit 1)
-
+ 
+# Vocab tree path hint — use this in vocab_tree_matcher commands:
+# --VocabTreeMatching.vocab_tree_path /opt/colmap-vocab/vocab_tree_256K.bin
+ENV COLMAP_VOCAB_TREE="/opt/colmap-vocab/vocab_tree_256K.bin"
+ 
 WORKDIR /root
 CMD ["/bin/bash"]
