@@ -29,14 +29,14 @@
 #
 # Note: cuDSS support was added in v2 of this Dockerfile but is now superseded
 # by Caspar, which is 10-100x faster than Ceres+cuDSS for the same problems.
- 
+
 # ============================================================
 # STAGE 1: builder — compiles COLMAP, discarded after this stage
 # ============================================================
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
- 
+
 ENV DEBIAN_FRONTEND=noninteractive
- 
+
 RUN apt-get update && apt-get install -y \
     git cmake ninja-build build-essential \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y \
     libqt5svg5-dev libopencv-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
- 
+
 # CMake fix: apt's 3.22.1 is too old for COLMAP's bundled faiss (needs 3.24+).
 RUN cd /tmp && \
     wget https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0-linux-x86_64.tar.gz && \
@@ -54,7 +54,7 @@ RUN cd /tmp && \
     mv cmake-3.29.0-linux-x86_64 /opt/cmake-3.29.0 && \
     rm cmake-3.29.0-linux-x86_64.tar.gz
 ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
- 
+
 # COLMAP 4.1.1 with Caspar GPU bundle adjustment enabled.
 # -DCASPAR_ENABLED=ON: enables Caspar (disabled by default, requires CUDA ≥7.0).
 # -DCMAKE_CUDA_ARCHITECTURES="86;89": Ampere + Ada Lovelace (A100/A40/3090 + 4090/4000Ada).
@@ -74,7 +74,7 @@ RUN cd /root && \
     ninja -j4 && \
     ninja install && \
     rm -rf /root/colmap
- 
+
 # Vocabulary tree (256K words) baked in for vocab_tree_matcher.
 # Faster alternative to exhaustive_matcher for large datasets (1000+ frames).
 # Usage: --VocabTreeMatching.vocab_tree_path $COLMAP_VOCAB_TREE
@@ -82,14 +82,14 @@ RUN mkdir -p /opt/colmap-vocab && \
     wget -q https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin \
         -O /opt/colmap-vocab/vocab_tree_256K.bin && \
     echo "Vocab tree: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
- 
+
 # ============================================================
 # STAGE 2: final — clean image, just the finished COLMAP install
 # ============================================================
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
- 
+
 ENV DEBIAN_FRONTEND=noninteractive
- 
+
 RUN apt-get update && apt-get install -y \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
     libopenimageio-dev libmetis-dev \
@@ -98,15 +98,14 @@ RUN apt-get update && apt-get install -y \
     libceres-dev libopencv-dev \
     tmux \
     && rm -rf /var/lib/apt/lists/*
- 
+
 COPY --from=builder /opt/colmap-install /opt/colmap-install
 COPY --from=builder /opt/colmap-vocab /opt/colmap-vocab
- 
+
 ENV PATH="/opt/colmap-install/bin:${PATH}"
 ENV COLMAP_VOCAB_TREE="/opt/colmap-vocab/vocab_tree_256K.bin"
- 
+
 RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check build args" && exit 1)
- 
+
 WORKDIR /root
 CMD ["/bin/bash"]
- 
