@@ -23,19 +23,19 @@
 # Source of the verified recipe:
 #   github.com/aws-solutions-library-samples/guidance-for-open-source-3d-reconstruction-toolbox-for-gaussian-splats-on-aws
 #   (source/container/Dockerfile, retrieved 2026-08-07)
-
+ 
 # ============================================================
 # STAGE 1: builder — compiles cuDSS-linked Ceres, then COLMAP against it
 # ============================================================
 FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS builder
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDSS_VERSION="0.7.1"
 ENV CERES_HASH="0ba987acaf9e8674070f116ed624edf017d2b630"
 # Broadened to match AWS's verified architecture list (Turing through Ada Lovelace).
 ENV CUDA_ARCHITECTURES="75;80;86;89"
 ENV NINJA_JOBS=2
-
+ 
 RUN apt-get update && apt-get install -y \
     git cmake ninja-build build-essential \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
@@ -43,9 +43,10 @@ RUN apt-get update && apt-get install -y \
     libgoogle-glog-dev libgtest-dev libgmock-dev libsqlite3-dev libglew-dev \
     qtbase5-dev libqt5opengl5-dev libcgal-dev \
     libqt5svg5-dev libopencv-dev \
+    libsuitesparse-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 # CMake fix: apt's default is too old for COLMAP's bundled faiss (needs 3.24+).
 RUN cd /tmp && \
     wget https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0-linux-x86_64.tar.gz && \
@@ -53,7 +54,7 @@ RUN cd /tmp && \
     mv cmake-3.29.0-linux-x86_64 /opt/cmake-3.29.0 && \
     rm cmake-3.29.0-linux-x86_64.tar.gz
 ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
-
+ 
 # --- cuDSS 0.7.1 via NVIDIA's official .deb local installer ---
 # (v4 used a raw tarball from the redist archive, which pulled 0.8.0 - the
 # broken pairing. This is NVIDIA's officially documented install method,
@@ -72,9 +73,9 @@ RUN wget https://developer.download.nvidia.com/compute/cudss/${CUDSS_VERSION}/lo
     && ln -sf /usr/include/libcudss/13/cudss.h /usr/include/cudss.h \
     && ln -sf /usr/include/libcudss/13/cudss_threading_interface.h /usr/include/cudss_threading_interface.h \
     && ln -sf /usr/include/libcudss/13/cudss_distributed_interface.h /usr/include/cudss_distributed_interface.h
-
+ 
 ENV cudss_DIR=/usr/lib/x86_64-linux-gnu/libcudss/13/cmake/cudss
-
+ 
 # --- Ceres Solver, built from source with CUDA + cuDSS ---
 # Same commit as v4 (proven correct - only the cuDSS version was wrong).
 # -DUSE_CUDSS=ON added explicitly (v4 was missing this - relied on
@@ -99,9 +100,9 @@ RUN git clone --recurse-submodules https://github.com/ceres-solver/ceres-solver 
     ninja -j${NINJA_JOBS} && \
     ninja install && \
     rm -rf /root/ceres-solver
-
+ 
 ENV Ceres_DIR=/usr/local/lib/cmake/Ceres
-
+ 
 # --- COLMAP 4.1.1, linked against the CUDA+cuDSS Ceres build above ---
 # Trying 4.1.1 (native equirectangular reconstruction, RANSAC fix) directly
 # rather than matching AWS's COLMAP 4.0.4 - if this fails, fall back to
@@ -126,29 +127,30 @@ RUN cd /root && \
     ninja -j${NINJA_JOBS} && \
     ninja install && \
     rm -rf /root/colmap
-
+ 
 # Vocabulary tree (256K words) for vocab_tree_matcher.
 RUN mkdir -p /opt/colmap-vocab && \
     wget -q https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin \
         -O /opt/colmap-vocab/vocab_tree_256K.bin && \
     echo "Vocab tree: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
-
+ 
 # ============================================================
 # STAGE 2: final — clean image with COLMAP + the Ceres/cuDSS it needs at runtime
 # ============================================================
 FROM nvidia/cuda:13.0.0-runtime-ubuntu22.04
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
-
+ 
 RUN apt-get update && apt-get install -y \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
     libopenimageio-dev libmetis-dev \
     libgoogle-glog-dev libsqlite3-dev libglew-dev \
     qtbase5-dev libqt5opengl5-dev libqt5svg5-dev \
     libopencv-dev \
+    libsuitesparse-dev \
     wget tmux \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 # Re-register cuDSS runtime library in the clean final stage (needed for
 # COLMAP to dynamically link against it at runtime, not just at build time).
 ENV CUDSS_VERSION="0.7.1"
@@ -162,16 +164,13 @@ RUN wget https://developer.download.nvidia.com/compute/cudss/${CUDSS_VERSION}/lo
     && ldconfig \
     && rm -f cudss-local-repo-ubuntu2204-${CUDSS_VERSION}_${CUDSS_VERSION}-1_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 COPY --from=builder /opt/colmap-install /opt/colmap-install
 COPY --from=builder /opt/colmap-vocab /opt/colmap-vocab
 COPY --from=builder /usr/local/lib /usr/local/lib
 RUN ldconfig
-
+ 
 ENV PATH="/opt/colmap-install/bin:${PATH}"
 ENV COLMAP_VOCAB_TREE="/opt/colmap-vocab/vocab_tree_256K.bin"
-
+ 
 RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check build args" && exit 1)
-
-WORKDIR /root
-CMD ["/bin/bash"]
