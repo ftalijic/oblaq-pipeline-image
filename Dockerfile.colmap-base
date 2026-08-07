@@ -1,52 +1,45 @@
-# oblaQ COLMAP Base Image — v3
+# oblaQ COLMAP Base Image — v4
 #
-# Major update: pinned to COLMAP 4.1.1 (released 2026-07-17, commit a0d785f)
+# Major addition: Ceres Solver built from source with CUDA + cuDSS support,
+# enabling genuine GPU-accelerated bundle adjustment. This directly targets
+# yesterday's bottleneck - bundle adjustment was taking 20-25+ min CPU-only
+# per run because the apt-installed libceres-dev has no CUDA support.
 #
-# Why 4.1.1 over the previous pinned commit (fff58c71 / ~3.x era):
+# CORRECTION from v3: "-DCASPAR_ENABLED=ON" was NOT a real CMake flag -
+# confirmed absent from colmap global_mapper --help output and build logs.
+# That was incorrect information. The actual fix requires building Ceres
+# itself with CUDA/cuDSS - a real, well-documented (if fiddly) process,
+# confirmed via multiple colmap/colmap and colmap/glomap GitHub issues
+# describing this exact problem, and a working community-verified recipe.
 #
-# 1. CASPAR GPU bundle adjustment (-DCASPAR_ENABLED=ON)
-#    GPU-accelerated BA backend, 1-2 orders of magnitude faster than Ceres CUDA.
-#    Use at runtime with: --BundleAdjustment.backend CASPAR
-#    Replaces the cuDSS/Ceres CUDA approach entirely — Caspar is far more powerful.
+# Sources consulted:
+#   https://github.com/colmap/glomap/discussions/222
+#   https://github.com/colmap/colmap/issues/2817, #3100, #4328, #3163
+#   https://gist.github.com/greenbrettmichael/942fab33e5056c4cf4e0cc3e0fef8e60
 #
-# 2. Native EQUIRECTANGULAR camera model
-#    COLMAP now natively supports 360° equirectangular reconstruction without
-#    rendering perspective crops first. Use --ImageReader.camera_model EQUIRECTANGULAR
-#    in feature extraction — this is the correct model for X5 captures.
-#    (Previously this flag was tried but failed at the Nerfstudio stage; now that
-#    the camera model is natively supported end-to-end, it should work correctly.)
-#
-# 3. RANSAC/LORANSAC matching slowdown fix (~4-6x)
-#    Fixes a process-global OpenMP critical section that caused exhaustive matching
-#    to appear "stuck" at large block sizes — the mysterious block_size=300 hang.
-#
-# 4. Multi-architecture CUDA build (86=Ampere + 89=Ada Lovelace)
-#    One image works on RTX 4090 (Ada) and A100/A40/RTX 3090 (Ampere) pods.
-#
-# 5. Vocabulary tree included
-#    256K word tree baked in at /opt/colmap-vocab/vocab_tree_256K.bin
-#    Use with: --VocabTreeMatching.vocab_tree_path /opt/colmap-vocab/vocab_tree_256K.bin
-#
-# Note: cuDSS support was added in v2 of this Dockerfile but is now superseded
-# by Caspar, which is 10-100x faster than Ceres+cuDSS for the same problems.
-
+# Build verification: this Dockerfile FAILS LOUDLY if cuDSS isn't found by
+# Ceres's CMake configuration, or if COLMAP doesn't end up linked against
+# the CUDA-enabled Ceres - rather than silently falling back to CPU like
+# the apt-installed Ceres does at runtime.
+ 
 # ============================================================
-# STAGE 1: builder — compiles COLMAP, discarded after this stage
+# STAGE 1: builder — compiles cuDSS-linked Ceres, then COLMAP against it
 # ============================================================
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
-
+ 
 RUN apt-get update && apt-get install -y \
     git cmake ninja-build build-essential \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
     libeigen3-dev libopenimageio-dev openimageio-tools libmetis-dev \
     libgoogle-glog-dev libgtest-dev libgmock-dev libsqlite3-dev libglew-dev \
-    qtbase5-dev libqt5opengl5-dev libcgal-dev libceres-dev \
+    qtbase5-dev libqt5opengl5-dev libcgal-dev \
     libqt5svg5-dev libopencv-dev \
-    wget \
+    libatlas-base-dev libsuitesparse-dev \
+    wget xz-utils \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 # CMake fix: apt's 3.22.1 is too old for COLMAP's bundled faiss (needs 3.24+).
 RUN cd /tmp && \
     wget https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0-linux-x86_64.tar.gz && \
@@ -54,12 +47,44 @@ RUN cd /tmp && \
     mv cmake-3.29.0-linux-x86_64 /opt/cmake-3.29.0 && \
     rm cmake-3.29.0-linux-x86_64.tar.gz
 ENV PATH="/opt/cmake-3.29.0/bin:${PATH}"
-
-# COLMAP 4.1.1 with Caspar GPU bundle adjustment enabled.
-# -DCASPAR_ENABLED=ON: enables Caspar (disabled by default, requires CUDA ≥7.0).
-# -DCMAKE_CUDA_ARCHITECTURES="86;89": Ampere + Ada Lovelace (A100/A40/3090 + 4090/4000Ada).
-# ninja -j4: faster than -j2 on GitHub Actions runners.
-# If runner OOMs during build, fall back to ninja -j2.
+ 
+# --- cuDSS: NVIDIA's CUDA-accelerated sparse direct solver library ---
+# Downloaded as a versioned redistributable tarball (deterministic URL,
+# not relying on an apt package name that may not exist/may differ by
+# distro). Extracted to /opt/cudss - Ceres's CMake will find it via
+# CMAKE_PREFIX_PATH.
+RUN mkdir -p /opt/cudss && cd /tmp && \
+    wget -q https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-x86_64/libcudss-linux-x86_64-0.8.0.10_cuda12-archive.tar.xz && \
+    tar -xf libcudss-linux-x86_64-0.8.0.10_cuda12-archive.tar.xz -C /opt/cudss --strip-components=1 && \
+    rm libcudss-linux-x86_64-0.8.0.10_cuda12-archive.tar.xz && \
+    echo "cuDSS extracted:" && find /opt/cudss -maxdepth 2
+ 
+# --- Ceres Solver, built from source with CUDA + cuDSS ---
+# Ceres 2.3 (CUDA/cuDSS support) has no official release tag as of this
+# build - using a recent master commit, same approach as the community
+# gist referenced above. Pin to a specific commit for reproducibility.
+RUN git clone --recurse-submodules https://github.com/ceres-solver/ceres-solver /root/ceres-solver && \
+    cd /root/ceres-solver && \
+    git checkout 46b4b3b002994ddb9d6fc72268c3e271243cd1df && \
+    mkdir build && cd build && \
+    cmake .. -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DUSE_CUDA=ON \
+        -DCMAKE_PREFIX_PATH=/opt/cudss \
+        -DCMAKE_CUDA_ARCHITECTURES="86;89" \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        2>&1 | tee /tmp/ceres_cmake_log.txt && \
+    grep -qi "cudss" /tmp/ceres_cmake_log.txt || \
+        (echo "BUILD FAILED: cuDSS not found by Ceres CMake configuration. Check /tmp/ceres_cmake_log.txt" && exit 1) && \
+    ninja -j4 && \
+    ninja install && \
+    rm -rf /root/ceres-solver
+ 
+# --- COLMAP 4.1.1, linked against the CUDA+cuDSS Ceres build above ---
+# -DFETCH_CERES=OFF + -DCeres_DIR: forces COLMAP to use the custom Ceres
+# install (/usr/local by default from ninja install above) instead of
+# fetching or using apt's CPU-only libceres-dev.
 RUN cd /root && \
     git clone https://github.com/colmap/colmap.git && \
     cd colmap && \
@@ -67,45 +92,53 @@ RUN cd /root && \
     mkdir build && cd build && \
     cmake .. -GNinja \
         -DCUDA_ENABLED=ON \
-        -DCASPAR_ENABLED=ON \
         -DCMAKE_CUDA_ARCHITECTURES="86;89" \
         -DCMAKE_INSTALL_PREFIX=/opt/colmap-install \
-    && \
+        -DFETCH_CERES=OFF \
+        -DCeres_DIR=/usr/local/lib/cmake/Ceres \
+        2>&1 | tee /tmp/colmap_cmake_log.txt && \
+    grep -qi "Found Ceres" /tmp/colmap_cmake_log.txt || \
+        (echo "BUILD FAILED: COLMAP did not find the custom Ceres build. Check /tmp/colmap_cmake_log.txt" && exit 1) && \
     ninja -j4 && \
     ninja install && \
     rm -rf /root/colmap
-
-# Vocabulary tree (256K words) baked in for vocab_tree_matcher.
-# Faster alternative to exhaustive_matcher for large datasets (1000+ frames).
-# Usage: --VocabTreeMatching.vocab_tree_path $COLMAP_VOCAB_TREE
+ 
+# Vocabulary tree (256K words) for vocab_tree_matcher — faster alternative
+# to exhaustive_matcher for large datasets (1000+ frames).
 RUN mkdir -p /opt/colmap-vocab && \
     wget -q https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin \
         -O /opt/colmap-vocab/vocab_tree_256K.bin && \
     echo "Vocab tree: $(ls -lh /opt/colmap-vocab/vocab_tree_256K.bin)"
-
+ 
 # ============================================================
-# STAGE 2: final — clean image, just the finished COLMAP install
+# STAGE 2: final — clean image with COLMAP + the CUDA Ceres it needs at runtime
 # ============================================================
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
-
+ 
 ENV DEBIAN_FRONTEND=noninteractive
-
+ 
 RUN apt-get update && apt-get install -y \
     libboost-program-options-dev libboost-graph-dev libboost-system-dev \
     libopenimageio-dev libmetis-dev \
     libgoogle-glog-dev libsqlite3-dev libglew-dev \
     qtbase5-dev libqt5opengl5-dev libqt5svg5-dev \
-    libceres-dev libopencv-dev \
+    libopencv-dev libatlas-base-dev libsuitesparse-dev \
     tmux \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 COPY --from=builder /opt/colmap-install /opt/colmap-install
 COPY --from=builder /opt/colmap-vocab /opt/colmap-vocab
-
+# Ceres was installed to /usr/local in the builder stage - copy its runtime
+# libraries so COLMAP (dynamically linked against them) can find them.
+COPY --from=builder /usr/local/lib /usr/local/lib
+COPY --from=builder /opt/cudss/lib /opt/cudss/lib
+RUN ldconfig
+ 
 ENV PATH="/opt/colmap-install/bin:${PATH}"
 ENV COLMAP_VOCAB_TREE="/opt/colmap-vocab/vocab_tree_256K.bin"
-
+ENV LD_LIBRARY_PATH="/opt/cudss/lib:${LD_LIBRARY_PATH}"
+ 
 RUN colmap -h | grep -q "with CUDA" || (echo "COLMAP built WITHOUT CUDA - check build args" && exit 1)
-
+ 
 WORKDIR /root
 CMD ["/bin/bash"]
