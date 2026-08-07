@@ -69,7 +69,7 @@ RUN sed -i 's/--SiftExtraction.use_gpu/--FeatureExtraction.use_gpu/' \
 # AttributeError: 'NoneType' object has no attribute 'CameraModelType'.
 # Note: the cuda-toolkit-12-4 metapackage does NOT actually install nvcc -
 # confirmed missing after installing it. These two specific packages are needed.
-RUN apt-get update && apt-get install -y cuda-nvcc-12-4 cuda-compiler-12-4 sqlite3 && \
+RUN apt-get update && apt-get install -y cuda-nvcc-12-4 cuda-compiler-12-4 sqlite3 libglm-dev && \
     rm -rf /var/lib/apt/lists/*
 ENV PATH="/usr/local/cuda-12.4/bin:${PATH}"
  
@@ -120,5 +120,6 @@ COPY start.sh /root/start.sh
 RUN chmod +x /root/start.sh
  
 WORKDIR /root
+ENTRYPOINT ["/root/start.sh"]
 ENTRYPOINT ["/root/start.sh"]
  
