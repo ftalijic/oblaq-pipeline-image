@@ -51,6 +51,57 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN sed -i 's/CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),/CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),\n    CameraModel(model_id=17, model_name="EQUIRECTANGULAR", num_params=2),/' \
     /root/nerfstudio-env/lib/python3.11/site-packages/nerfstudio/data/utils/colmap_parsing_utils.py
 
+# Nerfstudio internal COLMAP flag-rename patch: ns-process-data calls COLMAP
+# internally using OLD flag names (--SiftExtraction.use_gpu / --SiftMatching.use_gpu)
+# that don't exist in COLMAP 4.x (renamed to --FeatureExtraction.use_gpu /
+# --FeatureMatching.use_gpu). Without this, ns-process-data fails immediately
+# but LOOKS like a silent stall (0% CPU, no visible error) - cost ~1 hour of
+# confused debugging before the real cause was found. Different file from the
+# camera model patch above.
+RUN sed -i 's/--SiftExtraction.use_gpu/--FeatureExtraction.use_gpu/' \
+    /root/nerfstudio-env/lib/python3.11/site-packages/nerfstudio/process_data/colmap_utils.py && \
+    sed -i 's/--SiftMatching.use_gpu/--FeatureMatching.use_gpu/' \
+    /root/nerfstudio-env/lib/python3.11/site-packages/nerfstudio/process_data/colmap_utils.py
+
+# nvcc for gsplat: gsplat (Nerfstudio's Gaussian Splatting rasterizer)
+# JIT-compiles its CUDA kernel on first use. The base image's final stage is
+# CUDA runtime-only (no compiler) - without this, ns-train crashes with
+# AttributeError: 'NoneType' object has no attribute 'CameraModelType'.
+# Note: the cuda-toolkit-12-4 metapackage does NOT actually install nvcc -
+# confirmed missing after installing it. These two specific packages are needed.
+RUN apt-get update && apt-get install -y cuda-nvcc-12-4 cuda-compiler-12-4 sqlite3 && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH="/usr/local/cuda-12.4/bin:${PATH}"
+
+# gsplat CUDA compilation default: even with nvcc present, default parallel
+# compilation can get OOM-killed on specific files (exit code 137) despite
+# plenty of system RAM - a per-process memory spike issue during ninja's
+# default job count, not genuine RAM exhaustion. Confirmed fix: limit to 2.
+ENV MAX_JOBS=2
+
+# gsplat AOT (ahead-of-time) precompilation: gsplat supports building its
+# CUDA extension during pip install instead of waiting for JIT compilation
+# on first ns-train run. Doing this at IMAGE BUILD time (not on a live,
+# billing pod) eliminates: the ~5-10 min first-run wait, the OOM risk
+# happening mid-client-job, and needing nvcc present in the final runtime
+# image at all (though we keep it above for JIT fallback safety anyway).
+#
+# TORCH_CUDA_ARCH_LIST must be set explicitly - without it, building in
+# GitHub Actions (which has NO GPU present) can silently target the wrong
+# architecture or fail. 8.6=Ampere (A100/A40/3090), 8.9=Ada Lovelace
+# (RTX 4090/4000 Ada) - matches the same architectures targeted for COLMAP.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9"
+RUN /root/nerfstudio-env/bin/pip uninstall gsplat -y && \
+    /root/nerfstudio-env/bin/pip install --no-binary gsplat gsplat==1.4.0 2>&1 | tee /tmp/gsplat_build_log.txt && \
+    /root/nerfstudio-env/bin/python3 -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA extension failed to build'" || \
+    (echo "BUILD FAILED: gsplat CUDA extension did not build correctly. Check /tmp/gsplat_build_log.txt" && exit 1)
+
+# prepare_nerfstudio_masks.py: converts COLMAP-convention masks
+# (frame_0001.jpg.png) to Nerfstudio-convention (frame_0001.png in a masks/
+# subfolder). Was missing from the image, had to be rewritten from scratch
+# and manually uploaded during a live session - baking it in now.
+COPY prepare_nerfstudio_masks.py /root/prepare_nerfstudio_masks.py
+
 # --- SSH setup ---
 # RunPod injects the pod's authorized public key via a $PUBLIC_KEY environment
 # variable at container start (same convention their own stock templates
