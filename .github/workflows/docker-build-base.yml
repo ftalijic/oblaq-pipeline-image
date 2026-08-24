@@ -39,6 +39,7 @@ jobs:
           context: .
           file: ./Dockerfile.colmap-base
           push: true
+          pull: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/oblaq-colmap-base:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
