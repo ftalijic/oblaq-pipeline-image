@@ -1,0 +1,35 @@
+# oblaQ RealityScan Linux Image
+#
+# Wraps Epic Games' RealityScan (Wine-based, experimental Linux/Docker
+# deployment) as an alternative SfM/alignment engine to Dockerfile.colmap-base,
+# for large real-estate/hotel datasets where COLMAP's single-threaded global
+# positioning stage becomes a bottleneck.
+#
+# Source: dev.epicgames.com/documentation/realityscan/docker-deployment
+#         dev.epicgames.com/documentation/en-us/realityscan/remote-command-plugin-in-docker
+#
+# realityscan_*.deb is proprietary, gated behind an Epic Games account, and
+# is NOT fetched here from a public URL — see the workflow file for how it
+# gets staged into the build context before this Dockerfile runs.
+
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      curl wget bzip2 xz-utils x11-apps ca-certificates \
+      libgtk-3-0 libdbus-glib-1-2 libxt6 \
+      libx11-xcb1 libxcb-shm0 libxcb-dri3-0 \
+      libvulkan1 vulkan-tools \
+      libxcomposite1 libasound2 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY realityscan_*.deb /tmp/
+RUN apt-get update && apt-get install -y /tmp/realityscan_*.deb && \
+    rm /tmp/realityscan_*.deb && rm -rf /var/lib/apt/lists/*
+
+ENV WINE_CPU_TOPOLOGY=4:2
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
