@@ -45,7 +45,7 @@ ENV CUDSS_VERSION="0.7.1"
 ENV CERES_HASH="0ba987acaf9e8674070f116ed624edf017d2b630"
 # Broadened to match AWS's verified architecture list (Turing through Ada Lovelace),
 # plus Volta (70, V100) and Hopper (90, H100) for full RunPod GPU-tier coverage.
-ENV CUDA_ARCHITECTURES="70;75;80;86;89;90"
+ENV CUDA_ARCHITECTURES="75;80;86;89;90"
 ENV NINJA_JOBS=2
 
 RUN apt-get update && apt-get install -y \
